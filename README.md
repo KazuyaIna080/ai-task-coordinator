@@ -1,10 +1,28 @@
 # AI Task Coordinator
 
-Claude Desktop 用 MCP サーバー + Claude Code 自律実行ウォッチャー。
+**Claude Desktop ↔ Claude Code coordination system** with autonomous task dispatch, file-system watcher, and Markdown→HTML report rendering.
 
-Claude Desktop からタスクを投入すると、`coordination_watcher.py` が検知して Claude Code を自動起動し、完了後に結果を HTML でブラウザ表示します。
+## Quick Start — Standalone HTML output for `claude -p`
 
-## アーキテクチャ
+Pipe any `claude -p` output directly to a styled HTML page:
+
+```bash
+claude --dangerously-skip-permissions -p "Analyze this codebase" | python render_html.py
+
+# Custom title
+claude --dangerously-skip-permissions -p "..." | python render_html.py --title "My Report"
+
+# Save to specific file, don't open browser
+claude --dangerously-skip-permissions -p "..." | python render_html.py --out report.html --no-open
+```
+
+Output: `~/Desktop/result_YYYYMMDD_HHMMSS.html` (auto-opens in browser)
+
+No extra dependencies — `render_html.py` uses Python stdlib only.
+
+---
+
+## Architecture
 
 ```
 Claude Desktop
@@ -13,132 +31,135 @@ Claude Desktop
 AI Task Coordinator (index.js)        task_box/*.json
     │                                      │
     │                               coordination_watcher.py
-    │                                      │ DISPATCH
+    │                                      │ DISPATCH (watchdog)
     │                                      ▼
     │                               Claude Code (claude -p)
     │                                      │ COMPLETE
     │                                      ▼
-    │                               output_box/reports/{id}.html
+    │                        render_html.py → output_box/reports/{id}.html
     │                                      │ webbrowser.open
     │                                      ▼
-    └── check_task_result ────────── ブラウザで結果表示 + Toast通知
+    └── check_task_result ────── Browser report + Windows Toast
 ```
 
-## 主要コンポーネント
+Two independent HTML output paths — no duplicate output:
 
-### `render_html.py` — Markdown → HTML コンバーター
+| Path | Trigger | Output |
+|------|---------|--------|
+| Standalone | `claude -p ... \| python render_html.py` | `~/Desktop/result_*.html` |
+| Via watcher | `task_box` JSON `status: completed` | `output_box/reports/{id}.html` |
 
-標準ライブラリのみで動作する Markdown → HTML 変換エンジン。**単独 CLI** としても、**watcher からのライブラリ**としても使えます。
+---
 
-**対応要素:** 見出し / リスト / テーブル / コードブロック / インライン書式 / リンク / 水平線
+## Components
 
-**スタンドアロン（`claude -p` パイプ）:**
-```bash
-# 基本
-claude --dangerously-skip-permissions -p "調査して" | python render_html.py
+### `render_html.py` — Markdown → HTML converter
 
-# タイトル指定
-claude --dangerously-skip-permissions -p "..." | python render_html.py --title "調査レポート"
+Stdlib-only Markdown→HTML engine. Works as a **standalone CLI** or **imported library**.
 
-# 保存先指定・ブラウザ非表示
-claude --dangerously-skip-permissions -p "..." | python render_html.py --out report.html --no-open
-```
+Supported elements: headings, lists, tables, fenced code blocks, inline formatting, links, horizontal rules.
 
-出力先（デフォルト）: `~/Desktop/result_YYYYMMDD_HHMMSS.html`
-
-**ライブラリとして:**
+**Library API:**
 ```python
 from render_html import save_and_open, render_page, md_to_html_body
 
 path = save_and_open(markdown_text, title="My Report")
+html = render_page(markdown_text, title="Page Title", meta="2026-03-02")
+body = md_to_html_body(markdown_text)  # fragment only
 ```
 
-> **重複出力なし:** スタンドアロン（stdout パイプ）と watcher（task_box JSON）は完全に独立したパスを通るため干渉しません。
+**CSS features:** responsive layout, gradient header, dark-theme code blocks, striped tables.
 
 ---
 
-### `coordination_watcher.py` — 自律タスクディスパッチャー
+### `coordination_watcher.py` — Autonomous task dispatcher
 
-`task_box/` を監視し、pending タスクを自動処理します。HTML 生成は `render_html.py` に委譲しています。
+Monitors `task_box/` for pending tasks and auto-launches Claude Code. Delegates HTML rendering to `render_html.py`.
 
-**フロー:**
-1. `status: "pending"` を検知 → `claude --dangerously-skip-permissions -p` で自動起動
-2. `status: "completed"` を検知 → `render_html.save_and_open()` で HTML 生成 → ブラウザ自動オープン
-3. Windows トースト通知を送信（`win11toast` / PowerShell フォールバック）
+**Flow:**
+1. Detects `status: "pending"` → launches `claude --dangerously-skip-permissions -p`
+2. Detects `status: "completed"` → calls `render_html.save_and_open()` → opens browser
+3. Sends Windows toast notification (`win11toast` / PowerShell fallback)
 
-**起動:**
+> **Note:** Strips the `CLAUDECODE` environment variable from child processes to allow launching Claude Code from inside an active Claude Code session ([known issue #573](https://github.com/anthropics/claude-agent-sdk-python/issues/573)).
+
+**Start:**
 ```bash
 python coordination_watcher.py
-# または
+# or on Windows:
 start_watcher.bat
 ```
 
-**依存パッケージ:**
+**Dependencies:**
 ```bash
 pip install watchdog win11toast
 ```
 
-### `index.js` — MCP サーバー
+---
 
-Claude Desktop に以下のツールを提供します。
+### `index.js` — MCP Server
 
-#### メッセージング
-| Tool | 説明 |
-|------|------|
-| `send_message` | Claude Code へメッセージ送信 |
-| `check_messages` | 新着メッセージ確認（既読に更新） |
-| `get_thread` | スレッド全履歴取得 |
+Provides the following tools to Claude Desktop:
 
-#### タスク管理
-| Tool | 説明 |
-|------|------|
-| `submit_task` | task_box にタスク JSON を作成（status: pending） |
-| `check_task_result` | output_box → task_box フォールバックで結果取得 |
-| `list_tasks` | タスク一覧（status 別集計） |
+#### Messaging
+| Tool | Description |
+|------|-------------|
+| `send_message` | Send message to Claude Code |
+| `check_messages` | Check new messages (marks as read) |
+| `get_thread` | Get full thread history |
 
-#### LM Studio 連携
-| Tool | 説明 |
-|------|------|
-| `get_second_opinion` | ローカル LLM に意見を求める |
-| `get_code_review` | コードレビュー依頼 |
-| `list_local_models` | 利用可能モデル一覧 |
+#### Task Management
+| Tool | Description |
+|------|-------------|
+| `submit_task` | Create task JSON in task_box (status: pending) |
+| `check_task_result` | Fetch result from output_box → task_box fallback |
+| `list_tasks` | List tasks with status breakdown |
 
-#### PKA (Obsidian 連携)
-| Tool | 説明 |
-|------|------|
-| `save_insight` | 知見を Obsidian に保存 |
-| `save_learning` | 学び（文脈・例・注意点付き）を保存 |
-| `save_conversation_summary` | 会話サマリーを保存 |
+#### LM Studio
+| Tool | Description |
+|------|-------------|
+| `get_second_opinion` | Ask local LLM for a second opinion |
+| `get_code_review` | Request code review from local LLM |
+| `list_local_models` | List available local models |
 
-#### システム
-| Tool | 説明 |
-|------|------|
-| `check_services` | LM Studio / PKA / パス存在確認 |
+#### PKA (Obsidian)
+| Tool | Description |
+|------|-------------|
+| `save_insight` | Save insight to Obsidian vault |
+| `save_learning` | Save structured learning note |
+| `save_conversation_summary` | Save conversation summary |
 
-## セットアップ
+#### System
+| Tool | Description |
+|------|-------------|
+| `check_services` | Check LM Studio / PKA / path availability |
 
-### 1. MCP サーバー（Node.js）
+---
+
+## Setup
+
+### 1. MCP Server (Node.js)
 
 ```bash
 cd ai-task-coordinator
 npm install
 cp .env.example .env
-# .env を環境に合わせて編集
+# Edit .env for your environment
 ```
 
-**.env 設定項目:**
+**.env settings:**
 
-| 変数 | 説明 | 例 |
-|------|------|---|
-| `AI_COORDINATION_BASE` | AI 協調システムのベースパス | `C:/Users/.../ai_coordination` |
-| `LM_STUDIO_URL` | LM Studio API エンドポイント | `http://localhost:1234/v1` |
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `AI_COORDINATION_BASE` | Base path for AI coordination system | `C:/Users/.../ai_coordination` |
+| `LM_STUDIO_URL` | LM Studio API endpoint | `http://localhost:1234/v1` |
 | `PKA_API_URL` | Obsidian REST API URL | `https://127.0.0.1:27124` |
-| `PKA_API_KEY` | Obsidian REST API キー | （Obsidian で生成） |
-| `PKA_VAULT_FOLDER` | 保存先フォルダ名 | `Claude-Desktop` |
+| `PKA_API_KEY` | Obsidian REST API key | (generated in Obsidian) |
+| `PKA_VAULT_FOLDER` | Target folder name | `Claude-Desktop` |
 
-### 2. Claude Desktop に MCP 登録
+### 2. Register MCP in Claude Desktop
 
-`claude_desktop_config.json` に追加:
+Add to `claude_desktop_config.json`:
 
 ```json
 {
@@ -151,93 +172,92 @@ cp .env.example .env
 }
 ```
 
-### 3. Watcher 起動
+### 3. Start Watcher
 
 ```bash
 python coordination_watcher.py
 ```
 
-PC 起動時に自動実行したい場合は `start_watcher.bat` をタスクスケジューラに登録してください。
+To auto-start on Windows boot, register `start_watcher.bat` with Task Scheduler.
 
-## タスク JSON 仕様
+---
+
+## Task JSON Spec
 
 ```json
 {
   "id": "task_20260302XXXXXX",
   "type": "development | analysis | review | other",
-  "description": "タスク内容",
+  "description": "Task description",
   "priority": "high | medium | low",
   "submitted_at": "ISO timestamp",
-  "started_at":   "ISO timestamp（着手時に自動記入）",
-  "completed_at": "ISO timestamp（完了時に自動記入）",
+  "started_at":   "ISO timestamp (written by Claude Code on start)",
+  "completed_at": "ISO timestamp (written by Claude Code on finish)",
   "status": "pending | in_progress | completed | failed",
-  "result": "完了要約（Claude Code が記入）"
+  "result": "Completion summary (written by Claude Code)"
 }
 ```
 
-## HTML レポート出力
+---
 
-result / stdout が 100 文字以上の場合に HTML を生成しブラウザで開きます。
-
-| 経路 | トリガー | 出力先 |
-|------|---------|-------|
-| watcher 経由 | task_box JSON の `status: completed` | `output_box/reports/{task_id}.html` |
-| スタンドアロン | `claude -p ... \| python render_html.py` | `~/Desktop/result_*.html` |
-
-**CSS スタイル:** レスポンシブ、グラデーションヘッダー、ダークテーマコードブロック、縞テーブル
-
-## ディレクトリ構成
+## Directory Structure
 
 ```
 ai-task-coordinator/
-├── render_html.py            # Markdown→HTML コンバーター（CLI / ライブラリ兼用）
-├── coordination_watcher.py   # 自律タスクディスパッチャー
-├── index.js                  # MCP サーバー
-├── config.js                 # パス設定
-├── lm-studio-client.js       # LM Studio 連携
-├── pka-writer.js             # Obsidian REST API 連携
-├── start_watcher.bat         # Watcher 起動スクリプト（Windows）
-├── .env.example              # 環境変数テンプレート
+├── render_html.py            # Markdown→HTML converter (CLI + library)
+├── coordination_watcher.py   # Autonomous task dispatcher
+├── index.js                  # MCP server
+├── config.js                 # Path configuration
+├── lm-studio-client.js       # LM Studio integration
+├── pka-writer.js             # Obsidian REST API integration
+├── start_watcher.bat         # Watcher launcher (Windows)
+├── .env.example              # Environment template
 └── docs/
     ├── ARCHITECTURE.md
     ├── DESKTOP_PROTOCOL_REFERENCE.md
     ├── PKA_INTEGRATION.md
     └── PKA_PROJECT_PROPOSAL.md
 
-# 共有ディレクトリ（_AI_Coordination）
+# Shared directory (_AI_Coordination)
 ai_coordination/
-├── task_box/                 # タスク JSON 置き場
-├── output_box/reports/       # HTML レポート出力
+├── task_box/                 # Task JSON input
+├── output_box/reports/       # HTML report output
 └── messages/
     ├── desktop_to_code/
     ├── code_to_desktop/
     └── threads/
 ```
 
-## 依存関係
+---
 
-**Python (watcher):**
+## Dependencies
+
+**Python (watcher + renderer):**
 - Python 3.11+
-- `watchdog` — ファイルシステム監視
-- `win11toast` — Windows トースト通知（オプション、なければ PowerShell フォールバック）
+- `watchdog` — filesystem monitoring
+- `win11toast` — Windows toast notifications (optional; falls back to PowerShell)
 
-**Node.js (MCP サーバー):**
+**Node.js (MCP server):**
 - Node.js 18+
 
-**外部サービス（オプション）:**
-- LM Studio — ローカル LLM
+**External services (optional):**
+- LM Studio — local LLM
 - Obsidian + Local REST API plugin — PKA
 
-## バージョン履歴
+---
 
-| バージョン | 変更内容 |
-|-----------|---------|
-| v4.1.0 | `render_html.py` を独立モジュールとして切り出し。スタンドアロン CLI (`claude -p \| python render_html.py`) に対応。watcher との重複コードを解消 |
-| v4.0.0 | `coordination_watcher.py` 追加。HTML レポート自動生成、ブラウザ自動オープン、CLAUDECODE 環境変数除去によるネスト起動対応 |
-| v3.1.0 | PKA (Obsidian 連携) 追加 |
-| v3.0.0 | ファイルベースメッセージング |
-| v2.0.0 | Agent SDK 統合 |
-| v1.0.0 | 初期リリース |
+## Version History
+
+| Version | Changes |
+|---------|---------|
+| v4.1.0 | Extract `render_html.py` as standalone module. Add `claude -p \| python render_html.py` CLI. Eliminate duplicate code from watcher. |
+| v4.0.0 | Add `coordination_watcher.py`. Auto HTML report generation, browser auto-open, `CLAUDECODE` env var stripping for nested launch support. |
+| v3.1.0 | Add PKA (Obsidian) integration |
+| v3.0.0 | File-based messaging |
+| v2.0.0 | Agent SDK integration |
+| v1.0.0 | Initial release |
+
+---
 
 ## License
 
