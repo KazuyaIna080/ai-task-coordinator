@@ -134,8 +134,7 @@ def dispatch_task(fpath: str, task: dict) -> None:
             stdout=lf,
             stderr=lf,
             env=env,
-            # New visible console so you can watch Claude work (remove flag to go silent)
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
 
 # ── File system event handler ──────────────────────────────────────────────────
