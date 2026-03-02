@@ -19,23 +19,20 @@ import glob
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 import time
-import webbrowser
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver
+
+from render_html import save_and_open, HTML_MIN_LENGTH
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 TASK_BOX       = r"C:\Users\kazin\Desktop\_AI_Coordination\ai_coordination\task_box"
 LOG_DIR        = r"C:\Users\kazin\Desktop\_AI_Coordination\ai_coordination\logs"
 OUTPUT_REPORTS = r"C:\Users\kazin\Desktop\_AI_Coordination\ai_coordination\output_box\reports"
-
-# Minimum result length to trigger HTML rendering (shorter → toast only)
-HTML_MIN_LENGTH = 100
 
 # Default working directory when task JSON has no 'workdir' field
 DEFAULT_WORKDIR = r"C:\Users\kazin\Desktop\mobile_workspace\argus-1.0"
@@ -62,300 +59,14 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Markdown → HTML conversion (stdlib only) ───────────────────────────────────
-
-def _md_to_html_body(md: str) -> str:
-    """Convert a Markdown string to an HTML body fragment (no <html> wrapper)."""
-
-    def escape(s: str) -> str:
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    lines = md.split("\n")
-    html_parts: list[str] = []
-    i = 0
-
-    def apply_inline(text: str) -> str:
-        """Apply inline Markdown within a line (already HTML-escaped)."""
-        # Inline code  `code`
-        text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
-        # Bold **text** or __text__
-        text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
-        text = re.sub(r"__(.+?)__", r"<strong>\1</strong>", text)
-        # Italic *text* or _text_
-        text = re.sub(r"\*(.+?)\*", r"<em>\1</em>", text)
-        text = re.sub(r"_([^_]+)_", r"<em>\1</em>", text)
-        # Links [text](url)
-        text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
-        return text
-
-    in_code_block = False
-    code_lang = ""
-    code_lines: list[str] = []
-    in_list: list[str] = []   # stack of "ul" or "ol"
-    in_table = False
-    table_lines: list[str] = []
-
-    def flush_list() -> None:
-        while in_list:
-            html_parts.append(f"</{in_list.pop()}>")
-
-    def flush_table() -> None:
-        nonlocal in_table, table_lines
-        if not table_lines:
-            return
-        html_parts.append('<div class="table-wrap"><table>')
-        header_done = False
-        for tl in table_lines:
-            cols = [c.strip() for c in tl.strip().strip("|").split("|")]
-            if not header_done:
-                html_parts.append("<thead><tr>" +
-                    "".join(f"<th>{apply_inline(escape(c))}</th>" for c in cols) +
-                    "</tr></thead><tbody>")
-                header_done = True
-            else:
-                # skip separator rows (--- lines)
-                if all(re.match(r"^[-: ]+$", c) for c in cols):
-                    continue
-                html_parts.append("<tr>" +
-                    "".join(f"<td>{apply_inline(escape(c))}</td>" for c in cols) +
-                    "</tr>")
-        html_parts.append("</tbody></table></div>")
-        table_lines = []
-        in_table = False
-        table_header_done = False
-
-    while i < len(lines):
-        line = lines[i]
-
-        # ── Fenced code block ──
-        if line.strip().startswith("```"):
-            if in_code_block:
-                html_parts.append(f'<pre><code class="language-{escape(code_lang)}">' +
-                                   "\n".join(escape(cl) for cl in code_lines) +
-                                   "</code></pre>")
-                code_lines = []
-                code_lang = ""
-                in_code_block = False
-            else:
-                flush_list()
-                flush_table()
-                code_lang = line.strip()[3:].strip()
-                in_code_block = True
-            i += 1
-            continue
-
-        if in_code_block:
-            code_lines.append(line)
-            i += 1
-            continue
-
-        # ── Table row ──
-        if line.strip().startswith("|") and "|" in line.strip()[1:]:
-            flush_list()
-            if not in_table:
-                in_table = True
-            table_lines.append(line)
-            i += 1
-            continue
-        elif in_table:
-            flush_table()
-
-        # ── Headings ──
-        m = re.match(r"^(#{1,6})\s+(.*)", line)
-        if m:
-            flush_list()
-            level = len(m.group(1))
-            content = apply_inline(escape(m.group(2)))
-            html_parts.append(f"<h{level}>{content}</h{level}>")
-            i += 1
-            continue
-
-        # ── Horizontal rule ──
-        if re.match(r"^[-*_]{3,}\s*$", line):
-            flush_list()
-            html_parts.append("<hr>")
-            i += 1
-            continue
-
-        # ── Unordered list ──
-        m = re.match(r"^(\s*)[*\-+]\s+(.*)", line)
-        if m:
-            if not in_list or in_list[-1] != "ul":
-                in_list.append("ul")
-                html_parts.append("<ul>")
-            html_parts.append(f"<li>{apply_inline(escape(m.group(2)))}</li>")
-            i += 1
-            continue
-
-        # ── Ordered list ──
-        m = re.match(r"^(\s*)\d+\.\s+(.*)", line)
-        if m:
-            if not in_list or in_list[-1] != "ol":
-                in_list.append("ol")
-                html_parts.append("<ol>")
-            html_parts.append(f"<li>{apply_inline(escape(m.group(2)))}</li>")
-            i += 1
-            continue
-
-        # Non-list line: flush list
-        if in_list and line.strip() == "":
-            flush_list()
-
-        # ── Blank line ──
-        if line.strip() == "":
-            if in_list:
-                flush_list()
-            html_parts.append("")
-            i += 1
-            continue
-
-        # ── Plain paragraph ──
-        flush_list()
-        html_parts.append(f"<p>{apply_inline(escape(line))}</p>")
-        i += 1
-
-    flush_list()
-    flush_table()
-    if in_code_block and code_lines:
-        html_parts.append(f'<pre><code class="language-{escape(code_lang)}">' +
-                           "\n".join(escape(cl) for cl in code_lines) +
-                           "</code></pre>")
-
-    return "\n".join(html_parts)
-
-
-def render_result_html(task_id: str, result: str, task: dict) -> str:
-    """Build a full HTML page from a task result (Markdown or plain text)."""
-    completed_at = task.get("completed_at", "")
-    description  = task.get("description", "")[:200]
-
-    body_html = _md_to_html_body(result)
-
-    css = """
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            line-height: 1.7;
-            color: #1a1a2e;
-            background: #f0f4f8;
-            padding: 2rem 1rem;
-        }
-        .container {
-            max-width: 860px;
-            margin: 0 auto;
-            background: #ffffff;
-            border-radius: 12px;
-            box-shadow: 0 4px 24px rgba(0,0,0,.10);
-            overflow: hidden;
-        }
-        header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: #fff;
-            padding: 1.6rem 2rem;
-        }
-        header h1 { font-size: 1.25rem; font-weight: 700; }
-        header .meta { font-size: .8rem; opacity: .8; margin-top: .3rem; }
-        .content { padding: 2rem; }
-        h1,h2,h3,h4,h5,h6 {
-            margin: 1.4em 0 .5em;
-            font-weight: 600;
-            line-height: 1.3;
-        }
-        h1 { font-size: 1.6rem; border-bottom: 2px solid #e2e8f0; padding-bottom: .4rem; }
-        h2 { font-size: 1.3rem; border-bottom: 1px solid #e2e8f0; padding-bottom: .3rem; }
-        h3 { font-size: 1.1rem; }
-        p  { margin: .8em 0; }
-        a  { color: #667eea; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        ul, ol { margin: .6em 0 .6em 1.6em; }
-        li { margin: .2em 0; }
-        pre {
-            background: #1e1e2e;
-            color: #cdd6f4;
-            border-radius: 8px;
-            padding: 1rem 1.2rem;
-            overflow-x: auto;
-            font-size: .85rem;
-            margin: 1em 0;
-        }
-        code {
-            font-family: 'Cascadia Code', 'Fira Code', Consolas, monospace;
-        }
-        p code {
-            background: #eef2ff;
-            color: #4c1d95;
-            padding: .1em .4em;
-            border-radius: 4px;
-            font-size: .88em;
-        }
-        .table-wrap { overflow-x: auto; margin: 1em 0; }
-        table {
-            border-collapse: collapse;
-            width: 100%;
-            font-size: .9rem;
-        }
-        th, td {
-            border: 1px solid #e2e8f0;
-            padding: .5rem .8rem;
-            text-align: left;
-        }
-        th { background: #f7fafc; font-weight: 600; }
-        tr:nth-child(even) { background: #f9fafb; }
-        hr { border: none; border-top: 1px solid #e2e8f0; margin: 1.5em 0; }
-        strong { font-weight: 600; }
-        footer {
-            text-align: center;
-            font-size: .75rem;
-            color: #a0aec0;
-            padding: 1rem 2rem;
-            border-top: 1px solid #e2e8f0;
-        }
-    """
-
-    html = f"""<!DOCTYPE html>
-<html lang="ja">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{task_id} — Task Result</title>
-  <style>{css}</style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <h1>Task Result: {task_id}</h1>
-      <div class="meta">Completed: {completed_at}</div>
-    </header>
-    <div class="content">
-{body_html}
-    </div>
-    <footer>Generated by coordination_watcher &nbsp;|&nbsp; {task_id}</footer>
-  </div>
-</body>
-</html>"""
-    return html
-
+# ── HTML rendering (delegated to render_html.py) ───────────────────────────────
 
 def save_and_open_result(task_id: str, result: str, task: dict) -> str | None:
-    """Render result as HTML, save to output_box/reports/, open in browser.
-
-    Returns the HTML file path, or None if skipped (result too short).
-    """
-    if len(result) < HTML_MIN_LENGTH:
-        return None
-
+    """Render result as HTML, save to output_box/reports/, open in browser."""
     os.makedirs(OUTPUT_REPORTS, exist_ok=True)
     html_path = os.path.join(OUTPUT_REPORTS, f"{task_id}.html")
-
-    # If the result already looks like HTML, save it as-is
-    is_html = result.lstrip().startswith("<!DOCTYPE") or result.lstrip().startswith("<html")
-    content = result if is_html else render_result_html(task_id, result, task)
-
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    webbrowser.open(f"file:///{html_path.replace(chr(92), '/')}")
-    return html_path
+    title = f"Task Result: {task_id}"
+    return save_and_open(result, title=title, out_path=html_path)
 
 
 # ── Toast notification ─────────────────────────────────────────────────────────
