@@ -1,86 +1,111 @@
 # AI Task Coordinator
 
-Claude Desktop用MCPサーバー。3つの主要機能を提供：
+Claude Desktop 用 MCP サーバー + Claude Code 自律実行ウォッチャー。
 
-1. **Claude Desktop ↔ Claude Code メッセージング**
-2. **タスク管理** (task_box/output_box)
-3. **Local LLM連携** (LM Studio)
-4. **PKA** (Personal Knowledge Accumulator) - Obsidian連携
-
-## ツール一覧
-
-### メッセージング
-| Tool | Description |
-|------|-------------|
-| `send_message` | パートナーAIにメッセージ送信 |
-| `check_messages` | 新着メッセージ確認 |
-| `get_thread` | スレッド履歴取得 |
-
-### タスク管理
-| Tool | Description |
-|------|-------------|
-| `submit_task` | task_boxにタスク投入 |
-| `check_task_result` | output_boxから結果取得 |
-| `list_tasks` | タスク一覧表示 |
-
-### LM Studio連携
-| Tool | Description |
-|------|-------------|
-| `get_second_opinion` | ローカルLLMに意見を求める |
-| `get_code_review` | コードレビュー依頼 |
-| `list_local_models` | 利用可能モデル一覧 |
-
-### PKA (Obsidian連携)
-| Tool | Description |
-|------|-------------|
-| `save_insight` | 知見をObsidianに保存 |
-| `save_learning` | 学び（文脈・例・注意点付き）を保存 |
-| `save_conversation_summary` | 会話サマリーを保存 |
-
-### システム
-| Tool | Description |
-|------|-------------|
-| `check_services` | 全サービス接続状況確認 |
+Claude Desktop からタスクを投入すると、`coordination_watcher.py` が検知して Claude Code を自動起動し、完了後に結果を HTML でブラウザ表示します。
 
 ## アーキテクチャ
 
 ```
 Claude Desktop
-    ↓ MCP
-AI Task Coordinator (index.js)
-    ├── Messages ←→ Claude Code
-    ├── task_box/output_box ←→ AI Coordination System
-    ├── LM Studio (Local LLM)
-    └── PKA → Obsidian Vault → Smart Connections (RAG)
+    │ MCP (submit_task / send_message)
+    ▼
+AI Task Coordinator (index.js)        task_box/*.json
+    │                                      │
+    │                               coordination_watcher.py
+    │                                      │ DISPATCH
+    │                                      ▼
+    │                               Claude Code (claude -p)
+    │                                      │ COMPLETE
+    │                                      ▼
+    │                               output_box/reports/{id}.html
+    │                                      │ webbrowser.open
+    │                                      ▼
+    └── check_task_result ────────── ブラウザで結果表示 + Toast通知
 ```
 
-## インストール
+## 主要コンポーネント
+
+### `coordination_watcher.py` — 自律タスクディスパッチャー
+
+`task_box/` を監視し、pending タスクを自動処理します。
+
+**フロー:**
+1. `status: "pending"` を検知 → `claude --dangerously-skip-permissions -p` で自動起動
+2. `status: "completed"` を検知 → result を HTML レンダリング → ブラウザ自動オープン
+3. Windows トースト通知を送信（`win11toast` / PowerShell フォールバック）
+
+**起動:**
+```bash
+python coordination_watcher.py
+# または
+start_watcher.bat
+```
+
+**依存パッケージ:**
+```bash
+pip install watchdog win11toast
+```
+
+### `index.js` — MCP サーバー
+
+Claude Desktop に以下のツールを提供します。
+
+#### メッセージング
+| Tool | 説明 |
+|------|------|
+| `send_message` | Claude Code へメッセージ送信 |
+| `check_messages` | 新着メッセージ確認（既読に更新） |
+| `get_thread` | スレッド全履歴取得 |
+
+#### タスク管理
+| Tool | 説明 |
+|------|------|
+| `submit_task` | task_box にタスク JSON を作成（status: pending） |
+| `check_task_result` | output_box → task_box フォールバックで結果取得 |
+| `list_tasks` | タスク一覧（status 別集計） |
+
+#### LM Studio 連携
+| Tool | 説明 |
+|------|------|
+| `get_second_opinion` | ローカル LLM に意見を求める |
+| `get_code_review` | コードレビュー依頼 |
+| `list_local_models` | 利用可能モデル一覧 |
+
+#### PKA (Obsidian 連携)
+| Tool | 説明 |
+|------|------|
+| `save_insight` | 知見を Obsidian に保存 |
+| `save_learning` | 学び（文脈・例・注意点付き）を保存 |
+| `save_conversation_summary` | 会話サマリーを保存 |
+
+#### システム
+| Tool | 説明 |
+|------|------|
+| `check_services` | LM Studio / PKA / パス存在確認 |
+
+## セットアップ
+
+### 1. MCP サーバー（Node.js）
 
 ```bash
 cd ai-task-coordinator
 npm install
-```
-
-## 環境設定
-
-1. `.env.example` を `.env` にコピー
-2. 自分の環境に合わせて編集
-
-```bash
 cp .env.example .env
+# .env を環境に合わせて編集
 ```
 
-**.env の設定項目:**
+**.env 設定項目:**
 
 | 変数 | 説明 | 例 |
-|-----|------|---|
-| `AI_COORDINATION_BASE` | AI協調システムのパス | `C:/Users/.../ai_coordination` |
-| `LM_STUDIO_URL` | LM Studio APIエンドポイント | `http://localhost:1234/v1` |
-| `PKA_API_URL` | Obsidian REST APIのURL | `https://127.0.0.1:27124` |
-| `PKA_API_KEY` | Obsidian REST APIキー | (Obsidianで生成) |
+|------|------|---|
+| `AI_COORDINATION_BASE` | AI 協調システムのベースパス | `C:/Users/.../ai_coordination` |
+| `LM_STUDIO_URL` | LM Studio API エンドポイント | `http://localhost:1234/v1` |
+| `PKA_API_URL` | Obsidian REST API URL | `https://127.0.0.1:27124` |
+| `PKA_API_KEY` | Obsidian REST API キー | （Obsidian で生成） |
 | `PKA_VAULT_FOLDER` | 保存先フォルダ名 | `Claude-Desktop` |
 
-## Claude Desktop設定
+### 2. Claude Desktop に MCP 登録
 
 `claude_desktop_config.json` に追加:
 
@@ -95,59 +120,87 @@ cp .env.example .env
 }
 ```
 
+### 3. Watcher 起動
+
+```bash
+python coordination_watcher.py
+```
+
+PC 起動時に自動実行したい場合は `start_watcher.bat` をタスクスケジューラに登録してください。
+
+## タスク JSON 仕様
+
+```json
+{
+  "id": "task_20260302XXXXXX",
+  "type": "development | analysis | review | other",
+  "description": "タスク内容",
+  "priority": "high | medium | low",
+  "submitted_at": "ISO timestamp",
+  "started_at":   "ISO timestamp（着手時に自動記入）",
+  "completed_at": "ISO timestamp（完了時に自動記入）",
+  "status": "pending | in_progress | completed | failed",
+  "result": "完了要約（Claude Code が記入）"
+}
+```
+
+## HTML レポート出力
+
+result が 100 文字以上の場合、完了時に自動で HTML を生成しブラウザで開きます。
+
+- **出力先:** `output_box/reports/{task_id}.html`
+- **対応要素:** 見出し、リスト、テーブル、コードブロック、インライン書式、リンク
+- **CSS:** レスポンシブ、モノスペースコードブロック、ダークテーマコード
+
 ## ディレクトリ構成
 
 ```
 ai-task-coordinator/
-├── index.js              # MCPサーバー本体
-├── config.js             # パス設定
-├── lm-studio-client.js   # LM Studio連携
-├── pka-writer.js         # Obsidian REST API連携
+├── coordination_watcher.py   # 自律タスクディスパッチャー（メイン）
+├── index.js                  # MCP サーバー
+├── config.js                 # パス設定
+├── lm-studio-client.js       # LM Studio 連携
+├── pka-writer.js             # Obsidian REST API 連携
+├── start_watcher.bat         # Watcher 起動スクリプト（Windows）
+├── .env.example              # 環境変数テンプレート
 └── docs/
-    ├── ARCHITECTURE.md   # システム構成詳細
-    └── PKA_INTEGRATION.md # PKA連携ガイド
+    ├── ARCHITECTURE.md
+    ├── DESKTOP_PROTOCOL_REFERENCE.md
+    └── PKA_INTEGRATION.md
 
-_AI_Coordination/ai_coordination/
-├── task_box/             # タスク入力
-├── output_box/           # 処理結果
+# 共有ディレクトリ（_AI_Coordination）
+ai_coordination/
+├── task_box/                 # タスク JSON 置き場
+├── output_box/reports/       # HTML レポート出力
 └── messages/
-    ├── desktop_to_code/  # Desktop→Code
-    ├── code_to_desktop/  # Code→Desktop
-    └── threads/          # スレッド管理
-```
-
-## 使用例
-
-### 学びを保存
-```
-「Pythonのasyncioについて学んだことをObsidianに保存して」
-→ save_learning が呼ばれ、構造化された知見がVaultに保存
-```
-
-### Claude Codeに依頼
-```
-「このコードをClaude Codeにレビューしてもらって」
-→ send_message でメッセージ送信
-```
-
-### サービス確認
-```
-「システム状況を確認して」
-→ check_services で全接続状態表示
+    ├── desktop_to_code/
+    ├── code_to_desktop/
+    └── threads/
 ```
 
 ## 依存関係
 
+**Python (watcher):**
+- Python 3.11+
+- `watchdog` — ファイルシステム監視
+- `win11toast` — Windows トースト通知（オプション、なければ PowerShell フォールバック）
+
+**Node.js (MCP サーバー):**
 - Node.js 18+
-- Obsidian + Local REST API plugin (PKA用)
-- LM Studio (ローカルLLM用、オプション)
 
-## バージョン
+**外部サービス（オプション）:**
+- LM Studio — ローカル LLM
+- Obsidian + Local REST API plugin — PKA
 
-- **v3.1.0** - PKA (Obsidian連携) 追加
-- **v3.0.0** - ファイルベースメッセージング
-- **v2.0.0** - Agent SDK統合
-- **v1.0.0** - 初期リリース
+## バージョン履歴
+
+| バージョン | 変更内容 |
+|-----------|---------|
+| v4.0.0 | `coordination_watcher.py` 追加。HTML レポート自動生成、ブラウザ自動オープン、CLAUDECODE 環境変数除去によるネスト起動対応 |
+| v3.1.0 | PKA (Obsidian 連携) 追加 |
+| v3.0.0 | ファイルベースメッセージング |
+| v2.0.0 | Agent SDK 統合 |
+| v1.0.0 | 初期リリース |
 
 ## License
 
